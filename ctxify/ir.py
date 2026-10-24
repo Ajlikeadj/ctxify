@@ -14,6 +14,16 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
+@dataclass()
+class blockWarning:
+    """A structured note about something a converter repaired or skipped."""
+    code: str
+    message: str
+    severity: Severity = "info"
+    where: str | None = None
+
+
+
 Severity = Literal["info", "repair", "skip"]
 """``info``: nothing lost. ``repair``: input was fixed up (guessed encoding, trimmed junk rows).
 ``skip``: content was dropped or could not be read."""
@@ -114,3 +124,12 @@ class Document:
     blocks: Iterable[Block]
     meta: Meta = field(default_factory=Meta)
     warnings: list[ConversionWarning] = field(default_factory=list)
+
+@dataclass()
+class blockWarning:
+    """A structured note about something a converter repaired or skipped."""
+    
+    code: str
+    message: str
+    severity: Severity = "info"
+    where: str | None = None

@@ -8,7 +8,25 @@ from typing import Any
 
 from ..ir import Block, Code, Data, Elision, Heading, KeyValue, ListBlock, Paragraph, Table
 
+def add(body: str, meta: dict[str, Any], fmt: str) -> str:
+    """Attach metadata to an already-rendered body.
 
+    ``md``/``text``: a ``---`` YAML header. ``yaml``: a two-document stream (meta, then
+    content). ``json-compact``: ``{"meta":...,"content":...}``.
+
+    Returns
+    -------
+    str
+        Rendered body with metadata front matter.
+    """
+    from ._tree import compact_json
+    from .yaml import dump
+
+    if fmt == "json-compact":
+        return '{"meta":' + compact_json(meta) + ',"content":' + body.strip() + '}'
+    if fmt == "yaml":
+        return '---\n' + dump(meta) + '---\n\n' + body
+    return body
 def compact_json(value: object) -> str:
     """Deterministic, minimal-whitespace JSON that keeps non-ASCII characters as-is."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)

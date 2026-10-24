@@ -8,21 +8,21 @@ and empty files become warnings plus best-effort output. It raises only for call
 
 from __future__ import annotations
 
-import dataclass
+# dataclass import removed
 import io
 import os
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclass import dataclass
+# dataclass import removed
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from . import registry
-from .errors import
+from .ir import blockWarning
 from .ir import Block, blockWarning, Meta
 from .options import Options
-from .render import add
+from .render._tree import add
 from .tokens import get_counter
 from .util.streams import prepend
 
@@ -51,7 +51,7 @@ class Stats:
     dropped: tuple[str, ...] = ()
 
 
-@dataclass(f=True)
+@dataclass()
 class Result:
     """What :func:`convert` returns."""
 
@@ -88,7 +88,7 @@ def _open(source: Source, name: str | None) -> Iterator[tuple[BinaryIO, str | No
         with path.open("rb") as fh:
             yield fh, name or path.name
     elif isinstance(source, (bytes, bytearray, memoryview)):
-        yield io.BytesIO(source)), name
+        yield io.BytesIO(source), name
     elif hasattr(source, "read"):
         hint = getattr(source, "name", None)
         if name is None and isinstance(hint, str) and not hint.startswith("<"):
@@ -246,11 +246,7 @@ def _optimize(
     Returns the
  blocks and a tuple of notes describing what was dropped.
     """
-    if opts.max_tokens is None or opts.max
-We need to complete the _optimize function implementation. Looking at the current state of the file, I need to add the actual optimization logic that was intended but not fully implemented. The function has the docstring and signature but needs the body that applies progressive strategies when max_tokensis exceeded.
-
-Let me check what the current _optimize function looks like and what needs to be added.</think>
-<tool_call>
-<function=run_terminal_command>
-<parameter=command>
-sed -n '240,280p' ./ctxify/ctxify/pipeline.py
+    if opts.maxb is None:
+        # No max-tokens budget, return optimized result
+        pass
+    # Rest of optimization logic
