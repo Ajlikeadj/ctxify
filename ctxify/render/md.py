@@ -76,7 +76,11 @@ def _table(table: Table) -> str:
     width = table_width(table)
     if width == 0:
         return ""
-    render = {"markdown": _md_table, "csv": _csv_table, "records": _records_table}[table.style]
+    render = {
+        "markdown": _md_table,
+        "csv": _csv_table,
+        "records": _records_table,
+    }.get(table.style, _md_table)
     body = render(table, width)
     return f"Table: {one_line(table.caption)}\n{body}" if table.caption else body
 

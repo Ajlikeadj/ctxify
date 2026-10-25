@@ -7,13 +7,40 @@ double-quoted string, which is valid YAML. Tests round-trip the output through P
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from typing import Any
 
 _SAFE = re.compile(r"^[A-Za-z_][A-Za-z0-9_ .,/()+-]*$")
 _RESERVED = {"true", "false", "null", "yes", "no", "on", "off", "y", "n", "~"}
+_FORBIDDEN = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ufdd0-\ufdef\ufeff\ufffe\uffff]"
+)
+
+
+def _quote(text: str) -> str:
+    """YAML double-quoted scalar that never emits characters YAML forbids."""
+    out = ['"']
+    for char in text:
+        code = ord(char)
+        if char == '"':
+            out.append('\\"')
+        elif char == "\\":
+            out.append("\\\\")
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\t":
+            out.append("\\t")
+        elif char == "\r":
+            out.append("\\r")
+        elif 0xD800 <= code <= 0xDFFF:
+            out.append("\\ufffd")  # lone surrogate: replace, never emit
+        elif _FORBIDDEN.match(char):
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
 
 
 def _scalar(value: Any) -> str:
@@ -28,11 +55,20 @@ def _scalar(value: Any) -> str:
             return ".nan"
         if math.isinf(value):
             return ".inf" if value > 0 else "-.inf"
-        return repr(value)
+        # YAML 1.1 only recognises exponent notation when a decimal point is present
+        # ("1e-05" would load as a string), so normalise "1e-05" -> "1.0e-05".
+        text = repr(value)
+        lowered = text.lower()
+        if "e" in lowered:
+            mantissa, _, exponent = lowered.partition("e")
+            if "." not in mantissa:
+                mantissa += ".0"
+            return f"{mantissa}e{exponent}"
+        return text
     text = str(value)
     if _SAFE.match(text) and text == text.strip() and text.lower() not in _RESERVED:
         return text
-    return json.dumps(text, ensure_ascii=False)
+    return _quote(text)
 
 
 def _inline(value: Any) -> str:
@@ -57,10 +93,14 @@ def _lines(value: Any, depth: int) -> list[str]:
         return out
     if isinstance(value, list) and value:
         out = []
+        child_pad = "  " * (depth + 1)
         for item in value:
             if isinstance(item, (dict, list)) and item:
                 sub = _lines(item, depth + 1)
-                out.append(f"{pad}- {sub[0].lstrip()}")
+                # Replace the child indent of the first line with "- " so the nested
+                # mapping/sequence starts inline and its children stay correctly indented.
+                first = sub[0][len(child_pad) :]
+                out.append(f"{pad}- {first}")
                 out.extend(sub[1:])
             else:
                 out.append(f"{pad}- {_inline(item)}")

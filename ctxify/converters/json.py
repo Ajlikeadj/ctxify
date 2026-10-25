@@ -1,208 +1,132 @@
 """JSON/JSONL converter for ctxify.
 
-Handles deeply nested, huge, or irregular JSON/JSONL structures.
-Uses ijson for streaming iteration to avoid loading large files into memory.
+Reads the whole document rather than a truncated sample, reports duplicate keys and
+non-finite numbers instead of hiding them, and shapes the tree so that the common cases
+are token-efficient:
 
-Output: Markdown by default, with --table-style options for compact representation.
+* a flat object becomes one ``KeyValue`` block;
+* an array of objects becomes a ``Table`` (union of keys, first-seen order);
+* an array of strings becomes a ``ListBlock``;
+* anything else stays a ``Data`` block, which is lossless for JSON and YAML output.
+
+``--budget summary`` samples oversized arrays instead of emitting every element.
 """
 
 from __future__ import annotations
 
-import io
 import json
-from collections import Counter
-from typing import BinaryIO, Optional, Tuple, Any
+import math
+from typing import Any, BinaryIO
 
-from ..ir import Block, ConversionWarning, Document, Data, Elision, KeyValue, Meta, Paragraph, Table
+from ..ir import Block, ConversionWarning, Data, Document, Elision, KeyValue, ListBlock, Meta, Table
 from ..options import Options
-from ..util.encoding import detect_encoding, _strip_bom
+from ..util.encoding import detect_encoding
 from ..util.streams import prepend
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-def _safe_json_loads(text: str) -> Any:
-    """Parse JSON text safely, returning None on failure."""
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return None
+_SAMPLE = 64 * 1024
+_SUMMARY_ROWS = 20
+_MAX_TABLE_KEYS = 20
+_MAX_NESTING = 200
+_UNSET = object()
 
 
-def _infer_simple_type(value: Any) -> str:
-    """Infer a simple type name for display purposes."""
+def _compact(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _cell(value: Any) -> str:
+    """Render one JSON value as a table cell / key-value string."""
     if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "float"
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
     if isinstance(value, str):
-        return "string"
-    return "object"
-
-
-def _count_deep_nesting(obj: Any, max_depth: int = 50) -> int:
-    """Count maximum nesting depth of a JSON structure."""
-    if isinstance(obj, dict):
-        if not obj:
-            return 1
-        return 1 + max((_count_deep_nesting(v, max_depth - 1) for v in obj.values()), default=0)
-    if isinstance(obj, list):
-        if not obj:
-            return 1
-        return 1 + max((_count_deep_nesting(item, max_depth - 1) for item in obj), default=0)
-    return 0
-
-
-def _flatten_dict(
-    d: dict,
-    prefix: str = "",
-    max_depth: int = 10,
-    current_depth: int = 0,
-) -> dict:
-    """Flatten a nested dict up to max_depth levels.
-
-    Deeper nesting is summarized with prefix notation.
-    """
-    if current_depth >= max_depth:
-        return {prefix: f"[deep nesting, {max_depth} levels]"}
-
-    result: dict = {}
-    for key, value in d.items():
-        new_prefix = f"{prefix}.{key}" if prefix else key
-
-        if isinstance(value, dict):
-            if current_depth + 1 >= max_depth:
-                result[new_prefix] = f"[deep nesting]"
-            else:
-                result.update(_flatten_dict(value, new_prefix, max_depth, current_depth + 1))
-        elif isinstance(value, list):
-            result[new_prefix] = _summarize_array(value, max_depth, current_depth + 1)
-        else:
-            result[new_prefix] = value
-
-    return result
-
-
-def _summarize_array(
-    arr: list,
-    max_items: int = 10,
-    current_depth: int = 0,
-) -> str:
-    """Summarize an array for display in flattened JSON.
-
-    Shows first few items, then ellipsis if too many.
-    """
-    if not arr:
-        return "[]"
-
-    # Count non-null items
-    non_null = [item for item in arr if item is not None]
-
-    if len(non_null) <= max_items * 2:
-        # Small enough to show all
-        items_str = ", ".join(_value_to_summary(item) for item in non_null)
-        return f"[{items_str}]"
-
-    # Show first and last items with count
-    first = [_value_to_summary(item) for item in non_null[:max_items // 2]]
-    last = [_value_to_summary(item) for item in non_null[-max_items // 2:]]
-    total = len(non_null)
-
-    parts: list[str] = []
-    if first:
-        parts.append(", ".join(first))
-    if last:
-        parts.append(", ".join(last))
-    parts.append(f"[{total - len(first) - len(last)} more items]")
-
-    return "[" + ". ".join(parts) + "]"
-
-
-def _value_to_summary(value: Any) -> str:
-    """Convert a value to a summary string for JSON display."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return str(value)
+        return json.dumps(value)
     if isinstance(value, int):
         return str(value)
+    return _compact(value)
+
+
+def _sanitize_text(text: str) -> str:
+    """Replace lone surrogates (from ``\\ud800``-style escapes) with U+FFFD."""
+    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+
+
+def _finite(value: Any) -> Any:
+    """Replace NaN/Infinity and lone surrogates so every output encoding stays valid."""
     if isinstance(value, float):
-        # Show reasonable precision
-        if value == int(value):
-            return str(int(value))
-        return f"{value:.6g}"
+        return str(value) if not math.isfinite(value) else value
     if isinstance(value, str):
-        if len(value) > 40:
-            return f'"{value[:40]}..."'
-        return f'"{value}"'
-    return str(value)
+        return _sanitize_text(value)
+    if isinstance(value, dict):
+        return {_sanitize_text(str(k)): _finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite(v) for v in value]
+    return value
 
 
-def _infer_schema(obj: Any, max_depth: int = 5) -> dict:
-    """Infer a simple schema description from a JSON object.
-
-    Returns a dict with type info and example values.
-    """
-    if isinstance(obj, dict):
-        if not obj:
-            return {"type": "object", "example": {}}
-        # Get keys and their types
-        keys_info = {}
-        for key in list(obj.keys())[:20]:  # Limit to first 20 keys
-            val = obj[key]
-            keys_info[key] = {
-                "type": _infer_simple_type(val),
-                "example": _value_to_summary(val) if not isinstance(val, (dict, list)) or len(str(val)) < 50 else f"[{type(val).__name__}]",
-            }
-        return {
-            "type": "object",
-            "num_keys": len(obj),
-            "keys": keys_info,
-        }
-    if isinstance(obj, list):
-        if not obj:
-            return {"type": "array", "example": []}
-        # Sample first few items
-        samples = obj[:5] if len(obj) > 5 else obj
-        item_types = [_infer_simple_type(item) for item in samples]
-        return {
-            "type": "array",
-            "length": len(obj),
-            "item_type": item_types[0] if len(set(item_types)) == 1 else "mixed",
-            "example": _value_to_summary(obj[0]) if len(obj) > 0 and not isinstance(obj[0], (dict, list)) or len(str(obj[0])) < 50 else f"[{len(set(item_types))} item types]",
-        }
-    return {"type": type(obj).__name__, "value": _value_to_summary(obj)}
+def _has_surrogates(value: Any) -> bool:
+    stack: list[Any] = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if any("\ud800" <= char <= "\udfff" for char in node):
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
 
 
-# ── Converter ──────────────────────────────────────────────────────────────
+def _depth(value: Any) -> int:
+    """Iterative nesting depth, so pathological input cannot exhaust the stack."""
+    deepest = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        node, level = stack.pop()
+        deepest = max(deepest, level)
+        if isinstance(node, dict):
+            stack.extend((child, level + 1) for child in node.values())
+        elif isinstance(node, list):
+            stack.extend((child, level + 1) for child in node)
+    return deepest
+
+
+def _union_keys(records: list[dict[str, Any]]) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for record in records:
+        for key in record:
+            seen.setdefault(key, None)
+    return tuple(seen)
+
 
 class JsonConverter:
     """Converts ``.json``/``.jsonl`` files into clean IR blocks."""
 
     name = "json"
     extensions = (".json", ".jsonl")
-    needs_seekable = True  # JSONL may need random access for schema inference
+    needs_seekable = False
 
     def detect(self, head: bytes, filename: str | None) -> float:
         if filename and filename.lower().endswith(self.extensions):
             return 1.0
-        # Heuristic: if the bytes start with { or [, it might be JSON
-        if head and head[0:1] in (b"{", b"[") and b"\x00" not in head[:100]:
-            return 0.1
+        stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+        if stripped[:1] in (b"{", b"[") and b"\x00" not in head[:100]:
+            return 0.5
         return 0.0
 
     def convert(self, stream: BinaryIO, opts: Options, filename: str | None) -> Document:
-        """Convert JSON/JSONL input to IR blocks."""
-
-        # Read with encoding detection
-        sample = stream.read(65536)
-        guess = detect_encoding(sample)
         warnings: list[ConversionWarning] = []
-
+        sample = stream.read(_SAMPLE)
+        guess = detect_encoding(sample)
         if guess.method in ("detected", "fallback"):
             warnings.append(
                 ConversionWarning(
@@ -212,14 +136,11 @@ class JsonConverter:
                 )
             )
 
-        # Strip BOM if present
-        raw = _strip_bom(sample)
-
-        # Decode with replacement
+        raw = prepend(sample, stream)
         try:
-            text = raw.decode(guess.name or "utf-8", errors="replace")
-        except Exception:
-            text = raw.decode("utf-8", errors="replace")
+            text = raw.read().decode(guess.name, errors="replace")
+        finally:
+            raw.close()
 
         if "\ufffd" in text:
             warnings.append(
@@ -230,218 +151,142 @@ class JsonConverter:
                 )
             )
 
-        # Determine if this is JSONL (one JSON object per line) or single JSON
-        lines = text.splitlines()
-        non_empty_lines = [l for l in lines if l.strip()]
+        duplicates: list[str] = []
+        constants: list[str] = []
+        value = _parse_json(text, duplicates, constants)
 
-        is_jsonl = (
-            len(non_empty_lines) > 0
-            and all(_safe_json_loads(l) is not None for l in non_empty_lines[:20])
-            or filename and filename.lower().endswith(".jsonl")
-        )
-
-        meta = Meta(source=filename, type=self.name)
-
-        if is_jsonl:
-            return self._convert_jsonl(stream, text, meta, warnings)
-        else:
-            return self._convert_json(stream, text, meta, warnings)
-
-    def _convert_jsonl(
-        self, stream: BinaryIO, text: str, meta: Meta, warnings: list[ConversionWarning]
-    ) -> Document:
-        """Convert JSONL (one JSON object per line) to IR blocks."""
-
-        import ijson
-
-        blocks: list[Block] = []
-        schema: dict | None = None
-        array_summaries: list[str] = []
-        total_items = 0
-        seen_schemas: set[tuple] = set()
-
-        # Stream-parse JSONL with ijson
-        try:
-            # Parse as array of objects
-            # Use ijson.items for streaming
-            objects = list(ijson.items(io.BytesIO(text.encode("utf-8")), "item"))
-
-            if not objects:
+        if value is _UNSET:
+            records, bad_lines = _parse_jsonl(text)
+            if records is None:
                 warnings.append(
                     ConversionWarning(
-                        "empty-input",
-                        "JSONL file has no content.",
-                        "info",
+                        "invalid-json",
+                        "Input is neither valid JSON nor valid JSON Lines; nothing was emitted.",
+                        "skip",
                     )
                 )
-                return Document([Data({})], meta, warnings)
-
-            # Infer schema from first few objects
-            if objects:
-                schema = _infer_schema(objects[0], max_depth=5)
+                return Document([], Meta(source=filename, type=self.name), warnings)
+            if bad_lines:
                 warnings.append(
                     ConversionWarning(
-                        "schema-inferred",
-                        f"Inferred schema: {schema.get('type', 'object')} with {schema.get('num_keys', 0)} keys",
-                        "info",
+                        "jsonl-invalid-lines",
+                        f"Skipped {bad_lines} line(s) that were not valid JSON.",
+                        "repair",
                     )
                 )
+            value = records
 
-            # Process objects into KeyValue blocks
-            for i, obj in enumerate(objects):
-                total_items += 1
-
-                # Get schema info for this object
-                obj_schema = _infer_schema(obj, max_depth=5)
-
-                # Convert to KeyValue pairs
-                pairs: list[tuple[str, str]] = []
-                for key, value in obj.items():
-                    summary = _value_to_summary(value)
-                    pairs.append((key, summary))
-
-                # Check for repeated schema
-                pair_tuple = tuple(pairs)
-                if pair_tuple in seen_schemas:
-                    # Find existing block and add note
-                    pass  # we'll just keep the first one
-                else:
-                    seen_schemas.add(pair_tuple)
-                    blocks.append(KeyValue(tuple(pairs)))
-
-                # Track array summaries if this object has arrays
-                for key, value in obj.items():
-                    if isinstance(value, list):
-                        arr_summary = _summarize_array(value, max_items=5)
-                        if arr_summary not in array_summaries:
-                            array_summaries.append(arr_summary)
-
-            # Add elision if there are more objects than displayed
-            if len(objects) > 0 and len(objects) < 1000:
-                pass  # all objects fit
-
-        except Exception as exc:
+        if _has_surrogates(value):
             warnings.append(
                 ConversionWarning(
-                    "jsonl-error",
-                    f"JSONL parsing error: {type(exc).__name__}: {exc}",
+                    "invalid-unicode",
+                    "Lone UTF-16 surrogates were replaced with U+FFFD.",
                     "repair",
                 )
             )
-            # Fall back to treating as single JSON
-            stream.seek(0)
-            return self._convert_json(stream, text, meta, warnings)
 
-        # Add array summary if we have them
-        if array_summaries:
-            elision_blocks = [
-                Elision(count=len(array_summaries), what="array schemas")
-            ]
-            # Insert after the last block
-            if blocks:
-                blocks.extend(elision_blocks)
-            else:
-                blocks = elision_blocks
-
-        return Document(blocks, meta, warnings)
-
-    def _convert_json(
-        self, stream: BinaryIO, text: str, meta: Meta, warnings: list[ConversionWarning]
-    ) -> Document:
-        """Convert single JSON object/array to IR blocks."""
-
-        # Parse JSON
-        data = _safe_json_loads(text)
-        if data is None:
+        if _depth(value) > _MAX_NESTING:
             warnings.append(
                 ConversionWarning(
-                    "invalid-json",
-                    "Invalid JSON input.",
+                    "json-too-deep",
+                    f"Nesting depth exceeds {_MAX_NESTING}; "
+                    "the document was skipped rather than flattened.",
                     "skip",
                 )
             )
-            return Document([Data({})], meta, warnings)
+            return Document([], Meta(source=filename, type=self.name), warnings)
 
-        blocks: list[Block] = []
+        if duplicates:
+            warnings.append(
+                ConversionWarning(
+                    "duplicate-keys",
+                    "Duplicate object keys kept the last value: "
+                    + ", ".join(sorted(set(duplicates))),
+                    "repair",
+                )
+            )
+        if constants:
+            warnings.append(
+                ConversionWarning(
+                    "non-finite-number",
+                    "Non-standard JSON constants were preserved as strings in output: "
+                    + ", ".join(sorted(set(constants))),
+                    "repair",
+                )
+            )
 
-        # Handle different JSON types
-        if isinstance(data, dict):
-            blocks.extend(self._dict_to_blocks(data, max_depth=10))
-        elif isinstance(data, list):
-            blocks.extend(self._list_to_blocks(data, max_depth=10))
-        else:
-            # Scalar value
-            blocks.append(Data(data))
+        blocks = self._blocks(value, opts)
+        return Document(blocks, Meta(source=filename, type=self.name), warnings)
 
-        return Document(blocks, meta, warnings)
+    def _blocks(self, value: Any, opts: Options) -> list[Block]:
+        if isinstance(value, dict) and value and all(
+            not isinstance(v, (dict, list)) for v in value.values()
+        ):
+            return [
+                KeyValue(tuple((str(k), _cell(_finite(v))) for k, v in value.items()))
+            ]
 
-    def _dict_to_blocks(
-        self, d: dict, max_depth: int = 10, current_depth: int = 0
-    ) -> list[Block]:
-        """Convert a dict to IR blocks.
+        if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            records: list[dict[str, Any]] = value
+            keys = _union_keys(records)
+            if keys and len(keys) <= _MAX_TABLE_KEYS:
+                rows = tuple(
+                    tuple(_cell(_finite(record.get(key))) for key in keys) for record in records
+                )
+                if opts.budget == "summary" and len(rows) > _SUMMARY_ROWS:
+                    return [
+                        Table(tuple(keys), rows[:_SUMMARY_ROWS], style=opts.table_style),
+                        Elision(len(rows) - _SUMMARY_ROWS, "table rows"),
+                    ]
+                return [Table(tuple(keys), rows, style=opts.table_style)]
 
-        Uses flattening for deep nesting.
-        """
-        blocks: list[Block] = []
+        if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            items: tuple[str, ...] = tuple(_finite(v) for v in value)
+            if opts.budget == "summary" and len(items) > 100:
+                return [ListBlock(items[:50]), Elision(len(items) - 50, "list items")]
+            return [ListBlock(items)]
 
-        if current_depth >= max_depth:
-            # Summarize deep nesting
-            blocks.append(Elision(count=1, what="deeply nested dict"))
-            return blocks
+        if isinstance(value, list) and opts.budget == "summary" and len(value) > 50:
+            return [Data(_finite(value[:50])), Elision(len(value) - 50, "list items")]
 
-        # Try flattening
-        flat = _flatten_dict(d, max_depth=max_depth, current_depth=0)
+        return [Data(_finite(value))]
 
-        # Convert flattened dict to KeyValue blocks
-        pairs: list[tuple[str, str]] = []
-        for key, value in flat.items():
-            if isinstance(value, str) and len(value) > 60:
-                summary = value[:60] + "..."
-            else:
-                summary = _value_to_summary(value)
-            pairs.append((key, summary))
 
-        if pairs:
-            blocks.append(KeyValue(tuple(pairs)))
-        else:
-            blocks.append(Data(d))
+def _parse_json(text: str, duplicates: list[str], constants: list[str]) -> Any:
+    """Parse one JSON document; ``_UNSET`` means "not a single JSON document"."""
 
-        return blocks
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                duplicates.append(key)
+            result[key] = value
+        return result
 
-    def _list_to_blocks(
-        self, lst: list, max_depth: int = 10, current_depth: int = 0
-    ) -> list[Block]:
-        """Convert a list to IR blocks.
+    def constant_hook(name: str) -> float:
+        constants.append(name)
+        return {"NaN": float("nan"), "Infinity": float("inf"), "-Infinity": float("-inf")}[name]
 
-        Handles heterogeneous arrays by summarizing.
-        """
-        blocks: list[Block] = []
+    try:
+        return json.loads(text, object_pairs_hook=pairs_hook, parse_constant=constant_hook)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return _UNSET
 
-        if current_depth >= max_depth:
-            blocks.append(Elision(count=1, what="deeply nested list"))
-            return blocks
 
-        # Check if all items are homogeneous
-        if not lst:
-            blocks.append(Data(lst))
-            return blocks
-
-        # Check item types
-        item_types = set(type(item).__name__ for item in lst)
-        if len(item_types) == 1 and not isinstance(lst[0], (dict, list)):
-            # Homogeneous simple values - emit as Data
-            blocks.append(Data(lst))
-            return blocks
-
-        # Heterogeneous or dict/list items - process individually
-        for i, item in enumerate(lst):
-            if isinstance(item, dict):
-                sub_blocks = self._dict_to_blocks(item, max_depth, current_depth + 1)
-                blocks.extend(sub_blocks)
-            elif isinstance(item, list):
-                sub_blocks = self._list_to_blocks(item, max_depth, current_depth + 1)
-                blocks.extend(sub_blocks)
-            else:
-                blocks.append(Data(item))
-
-        return blocks
+def _parse_jsonl(text: str) -> tuple[list[Any] | None, int]:
+    """Parse JSON Lines; ``None`` if the input is clearly not JSONL."""
+    records: list[Any] = []
+    bad = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            bad += 1
+    if not records:  # nothing parsed at all
+        return None, bad
+    if len(records) == 1 and not bad and isinstance(records[0], (dict, list)):
+        # A single JSON object on one line is a JSON document, not JSONL.
+        return None, 0
+    return records, bad

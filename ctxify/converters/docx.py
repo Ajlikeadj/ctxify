@@ -1,57 +1,213 @@
 """DOCX converter for ctxify.
 
-Handles headings, lists, tables, footnotes, hyperlinks, tracked changes (accept by default),
-and comments (optional flag).
+Extracts headings, paragraphs (with inline hyperlinks as ``[text](url)``), tables,
+footnotes and a summary of tracked changes. Tracked insertions are accepted; tracked
+deletions are excluded.
 
-Output: Markdown by default, with --table-style options for tables.
+Security: the container is inspected before python-docx parses it. Oversized archives and
+absurd compression ratios (zip bombs) are refused, and ``word/footnotes.xml`` is parsed
+with ``defusedxml`` when installed.
 """
 
 from __future__ import annotations
 
-from typing import BinaryIO, Optional, List, Tuple, Any
+import re
+import zipfile
+from typing import Any, BinaryIO
 
-from docx import Document as DocxDocument
-from docx.oxml.ns import qn
-
-from ..ir import (
-    Block,
-    ConversionWarning,
-    Data,
-    Document,
-    Heading,
-    KeyValue,
-    Meta,
-    Paragraph,
-    Table as IRTable,
-)
+from ..ir import Block, ConversionWarning, Document, Heading, KeyValue, Meta, Paragraph
+from ..ir import Table as IRTable
 from ..options import Options
-from ..util.encoding import detect_encoding
+
+#: Refuse archives that expand past this size (a DOCX is a ZIP file).
+MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+#: Refuse members with an implausible compression ratio.
+MAX_COMPRESSION_RATIO = 200
+_MIN_RATIO_FILE = 1_000_000
+
+_HEADING_STYLES = {
+    "heading 1": 1,
+    "heading 2": 2,
+    "heading 3": 3,
+    "heading 4": 4,
+    "heading 5": 5,
+    "heading 6": 6,
+    "title": 1,
+    "subtitle": 2,
+}
+_SKIP_TAGS = {
+    "pPr",
+    "rPr",
+    "del",
+    "delText",
+    "instrText",
+    "proofErr",
+    "bookmarkStart",
+    "bookmarkEnd",
+}
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_MAX_FOOTNOTES = 50
 
 
-def _strip_bom(data: bytes) -> bytes:
-    """Strip UTF-8, UTF-16, or UTF-32 BOM from ``data``."""
-    if data.startswith(b"\xef\xbb\xbf"):
-        return data[3:]
-    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return data[2:]
-    return data
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
-def _safe_text(text: Any) -> str:
-    """Clean and safe text extraction."""
-    if text is None:
-        return ""
-    return str(text).replace("\x00", "")
+def _clean(text: str) -> str:
+    return text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _paragraph_text(para) -> str:
-    """Extract full text from a docx paragraph, including runs with formatting."""
+def _zip_guard(stream: BinaryIO) -> str | None:
+    """Return a refusal message when the container is malformed or dangerous."""
+    stream.seek(0)
+    try:
+        if not zipfile.is_zipfile(stream):
+            return "not a valid ZIP/DOCX container"
+        stream.seek(0)
+        with zipfile.ZipFile(stream) as archive:
+            total = 0
+            for info in archive.infolist():
+                total += info.file_size
+                if total > MAX_UNCOMPRESSED_BYTES:
+                    return (
+                        "archive expands beyond "
+                        f"{MAX_UNCOMPRESSED_BYTES // (1024 * 1024)} MiB (zip bomb guard)"
+                    )
+                if (
+                    info.file_size > _MIN_RATIO_FILE
+                    and info.compress_size
+                    and info.file_size / info.compress_size > MAX_COMPRESSION_RATIO
+                ):
+                    return "archive has an implausible compression ratio (zip bomb guard)"
+    except (zipfile.BadZipFile, OSError) as exc:
+        return f"not a valid ZIP/DOCX container: {exc}"
+    finally:
+        stream.seek(0)
+    return None
+
+
+def _run_text(element: Any) -> str:
+    """Text of a ``w:r`` including tabs/breaks; deleted text is excluded."""
     parts: list[str] = []
-    for run in para.runs:
-        t = _safe_text(run.text)
-        if t:
-            parts.append(t)
+    for node in element.iter():
+        name = _local(node.tag)
+        if name == "t":
+            parts.append(node.text or "")
+        elif name == "tab":
+            parts.append("\t")
+        elif name in ("br", "cr"):
+            parts.append("\n")
     return "".join(parts)
+
+
+def _hyperlink_target(paragraph: Any, element: Any) -> str | None:
+    from docx.oxml.ns import qn
+
+    rid = element.get(qn("r:id"))
+    if not rid:
+        return None
+    try:
+        return str(paragraph.part.rels[rid].target_ref)
+    except Exception:  # missing/broken relationship: keep the text, drop the link
+        return None
+
+
+def _paragraph_text(paragraph: Any) -> str:
+    pieces: list[str] = []
+
+    def walk(node: Any) -> None:
+        for child in node:
+            name = _local(child.tag)
+            if name in _SKIP_TAGS:
+                continue
+            if name == "r":
+                pieces.append(_run_text(child))
+            elif name == "hyperlink":
+                text = "".join(_run_text(run) for run in child if _local(run.tag) == "r")
+                target = _hyperlink_target(paragraph, child)
+                pieces.append(f"[{text}]({target})" if text and target else text)
+            else:
+                walk(child)
+
+    walk(paragraph._p)
+    return _clean("".join(pieces))
+
+
+def _classify_heading(style: str) -> int:
+    style = style.strip().lower()
+    if style in _HEADING_STYLES:
+        return _HEADING_STYLES[style]
+    match = re.fullmatch(r"heading\s+(\d+)", style)
+    if match:
+        return min(max(int(match.group(1)), 1), 6)
+    return 0
+
+
+def _heading_level(paragraph: Any) -> int:
+    style = getattr(getattr(paragraph, "style", None), "name", "") or ""
+    level = _classify_heading(style)
+    if level:
+        return level
+    ppr = paragraph._p.pPr
+    if ppr is not None:
+        outline = ppr.find(f"{_W_NS}outlineLvl")
+        if outline is not None:
+            try:
+                return min(max(int(outline.get(f"{_W_NS}val", "")) + 1, 1), 6)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _has_merged_cells(table: Any) -> bool:
+    from docx.oxml.ns import qn
+
+    for row in table.rows:
+        for cell in row.cells:
+            tc_pr = cell._element.find(qn("w:tcPr"))
+            if tc_pr is None:
+                continue
+            if tc_pr.find(qn("w:vMerge")) is not None or tc_pr.find(qn("w:gridSpan")) is not None:
+                return True
+    return False
+
+
+def _fromstring(data: bytes) -> Any:
+    try:
+        from defusedxml.ElementTree import fromstring
+    except ImportError:  # pragma: no cover - defusedxml is a declared extra
+        from xml.etree.ElementTree import fromstring
+    return fromstring(data)
+
+
+def _footnotes(stream: BinaryIO) -> tuple[str, ...]:
+    """Read ``word/footnotes.xml``; python-docx does not expose footnotes."""
+    from docx.oxml.ns import qn
+
+    stream.seek(0)
+    try:
+        with zipfile.ZipFile(stream) as archive:
+            try:
+                data = archive.read("word/footnotes.xml")
+            except KeyError:
+                return ()
+    except (zipfile.BadZipFile, OSError):
+        return ()
+    finally:
+        stream.seek(0)
+
+    try:
+        root = _fromstring(data)
+    except Exception:
+        return ()
+    notes: list[str] = []
+    for note in root.iter(qn("w:footnote")):
+        if note.get(qn("w:type")) in ("separator", "continuationSeparator", "continuationNotice"):
+            continue
+        text = "".join(node.text or "" for node in note.iter(qn("w:t"))).strip()
+        if text:
+            notes.append(text)
+    return tuple(notes[:_MAX_FOOTNOTES])
 
 
 class DocxConverter:
@@ -69,36 +225,30 @@ class DocxConverter:
         return 0.0
 
     def convert(self, stream: BinaryIO, opts: Options, filename: str | None) -> Document:
-        """Convert DOCX input to IR blocks."""
-
-        sample = stream.read(65536)
-        guess = detect_encoding(sample)
         warnings: list[ConversionWarning] = []
-
-        if guess.method in ("detected", "fallback"):
-            warnings.append(
-                ConversionWarning(
-                    "encoding-guessed",
-                    f"Input is not valid UTF-8; decoded as {guess.name} ({guess.method}).",
-                    "repair",
-                )
-            )
-
-        raw = _strip_bom(sample)
+        meta = Meta(source=filename, type=self.name)
 
         try:
-            text = raw.decode(guess.name or "utf-8", errors="replace")
-        except Exception:
-            text = raw.decode("utf-8", errors="replace")
-
-        if "\ufffd" in text:
+            from docx import Document as DocxDocument
+            from docx.table import Table as DocxTable
+            from docx.text.paragraph import Paragraph as DocxParagraph
+        except ImportError as exc:
             warnings.append(
                 ConversionWarning(
-                    "invalid-bytes",
-                    "Found U+FFFD replacement characters (undecodable bytes).",
-                    "repair",
+                    "docx-unavailable",
+                    f"python-docx is not installed ({exc}); install with "
+                    "`pip install 'ctxify[docx]'`.",
+                    "skip",
                 )
             )
+            return Document([], meta, warnings)
+
+        refusal = _zip_guard(stream)
+        if refusal is not None:
+            warnings.append(
+                ConversionWarning("docx-invalid", f"Cannot read DOCX: {refusal}", "skip")
+            )
+            return Document([], meta, warnings)
 
         stream.seek(0)
         try:
@@ -107,185 +257,103 @@ class DocxConverter:
             warnings.append(
                 ConversionWarning(
                     "docx-error",
-                    f"Failed to load DOCX: {type(exc).__name__}: {exc}",
+                    f"python-docx could not open the file: {type(exc).__name__}: {exc}",
                     "skip",
                 )
             )
-            return Document([Data({})], Meta(source=filename, type=self.name), warnings)
-
-        blocks, meta_warnings = self._extract_content(doc, warnings)
-        all_warnings = warnings + meta_warnings
-
-        meta = Meta(source=filename, type=self.name)
-
-        return Document(blocks, meta, all_warnings)
-
-    def _extract_content(
-        self, doc: DocxDocument, warnings: list[ConversionWarning]
-    ) -> tuple[list[Block], list[ConversionWarning]]:
-        """Extract IR blocks from a python-docx Document."""
+            return Document([], meta, warnings)
 
         blocks: list[Block] = []
-        meta_warnings: list[ConversionWarning] = []
+        try:
+            items = list(doc.iter_inner_content())
+        except AttributeError:  # python-docx < 1.1
+            items = [*doc.paragraphs, *doc.tables]
 
-        table_blocks = self._extract_tables(doc, warnings)
-        blocks.extend(table_blocks)
+        for item in items:
+            if isinstance(item, DocxParagraph):
+                text = _paragraph_text(item)
+                if not text.strip():
+                    continue
+                level = _heading_level(item)
+                blocks.append(Heading(level=level, text=text) if level else Paragraph(text=text))
+            elif isinstance(item, DocxTable):
+                block = self._table(item, opts, warnings)
+                if block is not None:
+                    blocks.append(block)
 
-        para_blocks = self._extract_paragraphs(doc, warnings)
-        blocks.extend(para_blocks)
+        for index, note in enumerate(_footnotes(stream), 1):
+            blocks.append(KeyValue((("footnote", f"{index}: {note}"),)))
 
-        footnote_blocks = self._extract_footnotes(doc, warnings)
-        blocks.extend(footnote_blocks)
-
-        changes_blocks = self._extract_tracked_changes(doc, warnings)
-        blocks.extend(changes_blocks)
-
-        return blocks, meta_warnings
-
-    def _extract_paragraphs(
-        self, doc: DocxDocument, warnings: list[ConversionWarning]
-    ) -> list[Block]:
-        """Extract paragraph blocks from docx."""
-        blocks: list[Block] = []
-
-        for para in doc.paragraphs:
-            text = _paragraph_text(para)
-
-            if len(text.strip()) < 1:
-                continue
-
-            style = (para.style.name or "").lower() if para.style else ""
-            level = self._classify_heading(style)
-
-            if level > 0:
-                blocks.append(Heading(level=level, text=text))
-            else:
-                blocks.append(Paragraph(text=text))
-
-        return blocks
-
-    def _classify_heading(self, style: str) -> int:
-        """Classify a paragraph style as a heading level (1-6) or 0 for body text."""
-        heading_styles: dict[str, int] = {
-            "heading 1": 1,
-            "heading 2": 2,
-            "heading 3": 3,
-            "heading 4": 4,
-            "heading 5": 5,
-            "heading 6": 6,
-            "title": 1,
-            "subtitle 1": 2,
-            "subtitle 2": 3,
-        }
-
-        if style in heading_styles:
-            return heading_styles[style]
-
-        if style.startswith("heading"):
-            match = re.search(r"heading\s+(\d)", style, re.IGNORECASE)
-            if match:
-                level = int(match.group(1))
-                return min(max(level, 1), 6)
-
-        return 0
-
-    def _extract_tables(
-        self, doc: DocxDocument, warnings: list[ConversionWarning]
-    ) -> list[Block]:
-        """Extract table blocks from docx."""
-        blocks: list[Block] = []
-
-        for table in doc.tables:
-            header: tuple[str, ...] = ()
-            rows: list[tuple[str, ...]] = []
-
-            first_row_cells = [_safe_text(cell.text) for cell in table.rows[0].cells]
-            header_candidates = sum(
-                1 for c in first_row_cells if c.strip() and not c.strip().isdigit() and len(c.strip()) < 20
-            )
-            is_header = header_candidates / max(1, len(first_row_cells)) > 0.5
-
-            if is_header:
-                header = tuple(first_row_cells)
-
-                for row in table.rows[1:]:
-                    row_text = tuple(_safe_text(cell.text) for cell in row.cells)
-                    if any(cell.strip() for cell in row_text):
-                        rows.append(row_text)
-            else:
-                for row in table.rows:
-                    row_text = tuple(_safe_text(cell.text) for cell in row.cells)
-                    if any(cell.strip() for cell in row_text):
-                        rows.append(row_text)
-
-            if header or rows:
-                blocks.append(
-                    IRTable(
-                        header=header if header else None,
-                        rows=tuple(rows),
-                        style="markdown",
-                    )
-                )
-
-                # Check for merged cells via XML vMerge attribute
-                has_merged = False
-                for row in table.rows:
-                    for cell in row.cells:
-                        tc_pr = cell._element.find(qn("w:tcPr"))
-                        if tc_pr is not None:
-                            vmerge = tc_pr.find(qn("w:vMerge"))
-                            if vmerge is not None and vmerge.get(qn("w:val")) == "restart":
-                                has_merged = True
-                                break
-                    if has_merged:
-                        break
-                if has_merged:
-                    warnings.append(
-                        ConversionWarning(
-                            "merged-cells",
-                            "Table contains merged cells; data may be incomplete.",
-                            "info",
-                        )
-                    )
-
-        return blocks
-
-    def _extract_footnotes(
-        self, doc: DocxDocument, warnings: list[ConversionWarning]
-    ) -> list[Block]:
-        """Extract footnote blocks (limited support)."""
-        blocks: list[Block] = []
-
-        footnotes = getattr(doc, "footnotes", [])
-        if footnotes:
-            for i, fn in enumerate(footnotes[:5]):
-                fn_text = _safe_text(getattr(fn, "text", "")) if hasattr(fn, "text") else ""
-                if fn_text:
-                    blocks.append(KeyValue((f"footnote {i + 1}", fn_text)))
-
-        return blocks
-
-    def _extract_tracked_changes(
-        self, doc: DocxDocument, warnings: list[ConversionWarning]
-    ) -> list[Block]:
-        """Extract tracked changes summary."""
-        blocks: list[Block] = []
-
-        total_changes = 0
-        for para in doc.paragraphs:
-            for run in para.runs:
-                total_changes += 1
-
-        if total_changes > 0:
-            blocks.append(
-                Paragraph(f"[Tracked changes: {total_changes} total changes, accepted (default)]")
-            )
+        changes = self._tracked_changes(doc)
+        if changes:
             warnings.append(
                 ConversionWarning(
                     "tracked-changes",
-                    f"DOCX has {total_changes} tracked changes (accepted by default).",
+                    f"{changes} tracked change(s): insertions accepted, deletions ignored.",
                     "info",
                 )
             )
 
-        return blocks
+        return Document(blocks, meta, warnings)
+
+    def _table(
+        self, table: Any, opts: Options, warnings: list[ConversionWarning]
+    ) -> IRTable | None:
+        try:
+            matrix = [[_clean(cell.text) for cell in row.cells] for row in table.rows]
+        except Exception as exc:
+            warnings.append(
+                ConversionWarning(
+                    "table-error",
+                    f"Skipped a table that could not be read: {type(exc).__name__}: {exc}",
+                    "skip",
+                )
+            )
+            return None
+
+        matrix = [row for row in matrix if any(cell.strip() for cell in row)]
+        if not matrix:
+            return None
+
+        width = max(len(row) for row in matrix)
+        matrix = [row + [""] * (width - len(row)) for row in matrix]
+
+        header: tuple[str, ...] | None = None
+        data = matrix
+        first = [cell.strip() for cell in matrix[0]]
+        if (
+            len(matrix) > 1
+            and all(first)
+            and len(set(first)) == len(first)
+            and not any(value.replace(".", "", 1).isdigit() for value in first)
+        ):
+            header = tuple(matrix[0])
+            data = matrix[1:]
+
+        if _has_merged_cells(table):
+            warnings.append(
+                ConversionWarning(
+                    "merged-cells",
+                    "Table contains merged cells; the same value may repeat across cells.",
+                    "info",
+                )
+            )
+        if len(matrix) == 1:
+            warnings.append(
+                ConversionWarning(
+                    "single-row-table",
+                    "Table has a single row; it was treated as data, not a header.",
+                    "info",
+                )
+            )
+        return IRTable(
+            header=header,
+            rows=tuple(tuple(row) for row in data),
+            style=opts.table_style,
+        )
+
+    def _tracked_changes(self, doc: Any) -> int:
+        from docx.oxml.ns import qn
+
+        body = doc.element.body
+        return sum(1 for _ in body.iter(qn("w:ins"))) + sum(1 for _ in body.iter(qn("w:del")))

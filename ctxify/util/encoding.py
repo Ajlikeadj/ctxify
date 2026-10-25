@@ -22,10 +22,6 @@ class EncodingGuess:
     method: Literal["bom", "utf-8", "detected", "fallback"]
 
 
-def _has_bom(data: bytes) -> bool:
-    return data.startswith(codecs.BOM_UTF8) or data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)) or data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
-
-
 def detect_encoding(sample: bytes) -> EncodingGuess:
     """Guess the encoding of ``sample`` (the first chunk of a file)."""
     if sample.startswith(codecs.BOM_UTF8):
@@ -56,11 +52,12 @@ def detect_encoding(sample: bytes) -> EncodingGuess:
 
 
 def _strip_bom(data: bytes) -> bytes:
-    """Strip UTF-8, UTF-16, or UTF-32 BOM from ``data``."""
+    """Strip a UTF-8, UTF-16 or UTF-32 BOM from ``data``."""
     if data.startswith(codecs.BOM_UTF8):
         return data[3:]
-    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return data[2:]
+    # UTF-32 LE starts with the UTF-16 LE BOM, so it must be checked first.
     if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return data[4:]
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         return data[2:]
     return data

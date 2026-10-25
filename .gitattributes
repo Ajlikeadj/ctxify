@@ -1,0 +1,11 @@
+# Normalize text files on commit so Windows and Unix checkouts agree.
+* text=auto eol=lf
+
+# Binary artefacts
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.docx binary
+*.zip binary
+*.whl binary

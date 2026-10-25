@@ -212,6 +212,15 @@ def test_non_seekable_input_is_buffered_for_converters_that_need_it(custom, pipe
     assert ctxify.convert(pipe(b"abc"), name="f.seek").text == "3:abc\n"
 
 
+def test_large_non_seekable_input_spools_to_disk(custom, pipe, monkeypatch):
+    import ctxify.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "_SPOOL_MEMORY", 4)
+    registry.register(NeedsSeek())
+    custom.append("needs-seek")
+    assert ctxify.convert(pipe(b"abcdefghij"), name="f.seek").text == "10:abcdefghij\n"
+
+
 def test_buffer_limit_gives_skip_warning(custom, pipe):
     registry.register(NeedsSeek())
     custom.append("needs-seek")

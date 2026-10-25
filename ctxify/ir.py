@@ -14,26 +14,20 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
-@dataclass()
-class blockWarning:
-    """A structured note about something a converter repaired or skipped."""
-    code: str
-    message: str
-    severity: Severity = "info"
-    where: str | None = None
-
-
-
 Severity = Literal["info", "repair", "skip"]
-"""``info``: nothing lost. ``repair``: input was fixed up (guessed encoding, trimmed junk rows).
+"""``info``: nothing lost. ``repair``: input was fixed up (guessed encoding, trimmed junk).
 ``skip``: content was dropped or could not be read."""
 
-TableStyle = Literal["markdown", "csv", "records"]
+TableStyle = Literal["auto", "markdown", "csv", "records"]
+
+# Character budgets used by the optimizer. Exposed so tests can pin them.
+CELL_ABBREVIATION = 60
+VALUE_ABBREVIATION = 120
 
 
 @dataclass(frozen=True)
 class ConversionWarning:
-    """A structured note about something a converter repaired or skipped."""
+    """A structured note about something a converter or the optimizer repaired or skipped."""
 
     code: str
     message: str
@@ -125,11 +119,20 @@ class Document:
     meta: Meta = field(default_factory=Meta)
     warnings: list[ConversionWarning] = field(default_factory=list)
 
-@dataclass()
-class blockWarning:
-    """A structured note about something a converter repaired or skipped."""
-    
-    code: str
-    message: str
-    severity: Severity = "info"
-    where: str | None = None
+
+__all__ = [
+    "Block",
+    "Code",
+    "ConversionWarning",
+    "Data",
+    "Document",
+    "Elision",
+    "Heading",
+    "KeyValue",
+    "ListBlock",
+    "Meta",
+    "Paragraph",
+    "Severity",
+    "Table",
+    "TableStyle",
+]

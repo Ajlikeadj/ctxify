@@ -1,135 +1,149 @@
 # ctxify
 
-**ctxify** is a lightweight, fast CLI tool and importable Python library that converts enterprise files into clean, token-optimized context for LLMs. It focuses on robustness to bad input and minimizing token count without losing meaning.
+**ctxify** is a lightweight CLI and importable Python library that turns enterprise files
+into clean, token-optimized context for LLMs. It favours robustness over cleverness: bad
+input becomes a warning plus best-effort output, never a traceback.
+
+```text
+text / logs  ·  CSV / TSV  ·  JSON / JSONL  ·  DOCX
+```
 
 ## Installation
 
+From a checkout (the normal route until the package is published on PyPI):
+
 ```bash
-pip install ctxify
-# Or with optional dependencies:
-pip install ctxify[pdf,docx,ocr,xlsx]
+pip install -e ".[all]"   # everything
+pip install -e .           # core only, stdlib-only
 ```
+
+The optional extras are also installable individually once published:
+
+```bash
+pip install "ctxify[tokens]"   # tiktoken for exact token counts
+pip install "ctxify[csv]"      # charset-normalizer for better encoding guesses
+pip install "ctxify[docx]"     # python-docx + defusedxml
+```
+
+Python 3.10+ is required. The core package is stdlib-only; heavy parsers live in extras.
 
 ## Quickstart
 
 ```bash
-# Convert a DOCX file to Markdown
 ctxify report.docx --format md
-
-# Convert with token budget
 ctxify data.csv --format md --max-tokens 4000
-
-# Add front matter
-ctxify slides.pptx --front-matter=True
-
-# Stream from stdin
+ctxify slides.json --front-matter
 cat sales.csv | ctxify --type csv -
 ```
 
-## CLI Reference
+## CLI reference
 
 | Option | Description |
 |--------|-------------|
 | `--format` | Output format: `md` (default), `json-compact`, `yaml`, `text` |
-| `--table-style` | Table representation: `markdown`, `csv`, `keyvalue` |
-| `--max-tokens N` | Hard token budget; apply progressive strategies if exceeded |
-| `--front-matter` | Emit YAML front matter with source info and warnings |
-| `--strict` | Fail on errors instead of best-effort recovery |
-| `--type` | Force input type: `csv`, `json`, `jsonl`, `docx`, `pdf` |
-| `--budget` | CSV budget setting: `summary` (header stats + sample) or `full` |
+| `--table-style` | `auto` (default), `markdown`, `csv`, `records` (`keyvalue` is an alias) |
+| `--max-tokens N` | Hard token budget; progressive strategies run until the body fits |
+| `--front-matter` | Emit YAML front matter with source, type, tokens and warnings |
+| `--strict` | Fail with exit code 1 instead of repairing or skipping |
+| `--type` | Force a converter: `text`, `csv`, `json`, `docx` |
+| `--budget` | `full` (default) or `summary` (column stats + sample) |
+| `--token-backend` | `auto` (default), `tiktoken`, `chars` |
+| `--out DIR` | Write one file per input into `DIR` |
+| `--list-types` | List converters and exit |
+| `--version` | Print the version |
 
-## Token Optimization
+Boolean flags also accept an explicit value: `--front-matter=True`, `--strict=False`.
 
-ctxify applies the following strategies to minimize token count:
+Exit codes: `0` success (warnings allowed), `1` `--strict` failure, `2` usage or I/O error.
 
-- **Boilerplate stripping**: Removes repeated headers/footers, page numbers, whitespace noise
-- **Table optimization**: Auto-selects the most token-efficient representation:
-  - Markdown tables for small tables
-  - Compact CSV-in-codeblock for larger tables
-  - Key:value records for sparse data
-- **JSON flattening/summarization**: 
-  - Collapses deep nesting into schema + rows form
-  - Truncates long arrays with `[... N more items]`
-  - Configurable sample size
-- **CSV budget mode**: Emits column type inference, row count, null rates
-- **Progressive deduction**: When `--max-tokens` is exceeded:
-  1. Dedupe consecutive duplicate blocks
-  2. Abbreviate long values
-  3. Sample KeyValue arrays
-  4. Summarize tables (header-only or compact CSV)
+## Library API
 
-Output reports what was dropped at each stage.
+```python
+import ctxify
 
-## Format Support
+result = ctxify.convert("report.docx", format="md", front_matter=True, max_tokens=4000)
+print(result.text)          # rendered body (+ front matter)
+print(result.warnings)      # tuple of ConversionWarning
+print(result.stats)         # tokens, token_backend, blocks, converter, dropped
 
-### CSV/TSV
-- Handles unknown encodings, BOMs, mixed quotes, ragged rows, duplicate headers
-- Default: Markdown table
-- `--table-style csv` for compact CSV-in-codeblock
+# Bytes, streams and stdin-like objects work too
+ctxify.convert(data, name="report.csv")
+ctxify.convert(open("a.json", "rb"), format="yaml")
+```
 
-### JSON/JSONL
-- Flattens deeply nested structures
-- Collapses repeated schemas into schema + rows form
-- Truncates long arrays with `[... N more items]`
-- Default: compact JSON
+`ctxify.convert` raises only for caller errors (`TypeError` for an unsupported source,
+`ValueError` for a bad option or unknown type, `OSError` for a missing file), an unusable
+explicit tokenizer, and `ConversionError` in `strict` mode.
+
+## What each converter guarantees
+
+### Text / logs
+Detects BOMs and encodings, strips control characters, collapses whitespace runs and
+breadline runs, and keeps line structure inside a paragraph.
+
+### CSV / TSV
+- Parses the **whole file** with a real CSV reader, including quoted newlines.
+- Detects `, ; \t |` from the content (and `.tsv` from the extension).
+- Reports ragged rows and pads them instead of truncating data.
+- **Never** de-duplicates rows or filters "suspicious" rows: conversion must not change
+  the data. Structural problems are warnings.
+- `--budget summary` emits column type inference, row count and null rate plus a sample.
+
+### JSON / JSONL
+- Parses the whole document; a single object becomes key/value pairs, an array of objects
+  becomes a table with the union of keys, an array of strings becomes a list, and anything
+  nested stays a lossless `Data` block for JSON/YAML output.
+- Reports duplicate keys and non-standard `NaN`/`Infinity` constants instead of hiding them.
+- JSONL skips only the invalid lines and says how many.
 
 ### DOCX
-- Headings (1-6), lists, tables, footnotes, hyperlinks
-- Tracked changes (accepted by default)
-- Comments (optional flag)
-- Default: Markdown with markdown tables
+- Document order is preserved (paragraphs and tables interleaved as authored).
+- Headings, nested tables, inline hyperlinks (`[text](url)`), footnotes and tracked changes.
+- Tracked insertions are accepted; tracked deletions are excluded, with a warning.
+- The ZIP container is checked for zip-bomb sizes/ratios before parsing, and footnotes are
+  parsed with `defusedxml` when available.
 
-### PDF (optional, `ctxify[pdf]`)
-- Text-based PDFs including tables, multi-column layouts, headers/footers
-- Detects scanned/image-only PDFs and warns (OCR behind extra dependency)
+## Token optimization
 
-### Stretch: XLSX, HTML, plain text/logs
+`--table-style auto` picks per table: `records` for sparse data, Markdown for small tables,
+compact CSV for large ones.
 
-## Output Formats
+When `--max-tokens N` is exceeded, these strategies run in order until the rendered body
+fits, and `stats.dropped` / front matter record what happened:
 
-### Markdown (default)
-Clean Markdown with appropriate headings, tables, and structure.
+1. Remove empty blocks and collapse consecutive duplicates
+2. Abbreviate long cell and value strings
+3. Sample oversized tables and key/value lists (with visible `[... N more]` elisions)
+4. Render tables as compact CSV
+5. Keep table headers only
+6. Drop whole trailing blocks
+7. Truncate the final block, closing any open code fence
 
-### JSON-Compact
-One-line compact JSON representation.
+Token counting uses `tiktoken` (`o200k_base`) when installed and the backend name is always
+reported, because exact and heuristic counts differ.
 
-### YAML
-YAML representation of the content.
-
-### Text
-Plain text extraction.
-
-## Front Matter
-
-When `--front-matter=True`, emits YAML front matter like:
+## Front matter
 
 ```yaml
 ---
 source: report.docx
 type: docx
-pages: 5
-token-estimate: 2400
+tokens: 2400
+token_backend: tiktoken:o200k_base
 warnings:
-  - encoding-guessed
-  - tracked-changes
+  - "tracked-changes: 3 tracked change(s): insertions accepted, deletions ignored."
+---
 ```
 
 ## Development
 
 ```bash
-# Install in dev mode
-pip install -e ".[pdf,docx,ocr,xlsx]"
-
-# Run tests
-python -m pytestctxify
-
-# Run ruff linter
-ruff check .
-
-# Format code
-ruff format
+python -m pip install -e ".[dev]"
+python -m pytest
+python -m ruff check .
+python -m mypy
 ```
 
 ## License
 
-MIT License - see the LICENSE file for details.
+MIT — see [LICENSE](LICENSE).

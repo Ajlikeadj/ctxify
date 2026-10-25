@@ -14,7 +14,7 @@ from .ir import ConversionWarning, Document, Meta
 from .options import Options
 from .pipeline import Result, Stats, convert
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "ConversionError",

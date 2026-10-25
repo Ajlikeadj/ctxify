@@ -36,7 +36,9 @@ def render_block(block: Block) -> str:
         width = table_width(block)
         rows = ([block.header] if block.header is not None else []) + list(block.rows)
         body = "\n".join("\t".join(one_line(c) for c in _pad(r, width)) for r in rows)
-        return f"{one_line(block.caption)}\n{body}" if block.caption and body else body
+        if block.caption:
+            return f"{one_line(block.caption)}\n{body}".rstrip("\n")
+        return body
     if isinstance(block, Code):
         return block.text.rstrip("\n")
     if isinstance(block, KeyValue):

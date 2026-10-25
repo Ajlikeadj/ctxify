@@ -1,0 +1,9 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include pyproject.toml
+
+recursive-include tests *.py
+recursive-include ctxify py.typed
+
+global-exclude __pycache__ *.py[cod] .DS_Store

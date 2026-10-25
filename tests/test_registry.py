@@ -60,6 +60,12 @@ def test_binary_with_no_matching_converter_is_none():
     assert registry.detect(b"\x00\x01\x02", "blob.bin")[0] is None
 
 
+def test_unavailable_type_explains_how_to_install(monkeypatch):
+    monkeypatch.setitem(registry._missing, "pdf", "No module named 'pdfplumber'")
+    with pytest.raises(ValueError, match=r"pip install 'ctxify\[pdf\]'"):
+        registry.detect(b"", None, forced="pdf")
+
+
 def test_buggy_detect_becomes_note_not_crash(custom):
     class Bad(Fake):
         def detect(self, head, filename):  # type: ignore[no-untyped-def]

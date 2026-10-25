@@ -10,6 +10,9 @@ Detection scores every registered converter and picks the highest score:
 Ties go to the converter registered first. Built-ins load lazily on first use, and
 third-party plugins (entry-point group ``ctxify.converters``) are only consulted when no
 built-in recognises the input, so the common path never pays for ``importlib.metadata``.
+
+A built-in whose optional dependency is missing is skipped, not fatal: the rest of the
+library keeps working and forcing that type by name explains what to install.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ class Converter(Protocol):
 
     Attributes:
         name: Unique type name (used by ``--type``).
-        extensions: Lowercase extensions including the dot, e.g. ``(".csv", ".tsv")``.
+        extensions: Lowercase extensions including the dot, e.g. ``(\".csv\", \".tsv\")``.
         needs_seekable: True if ``convert`` needs ``seek()`` (zip/PDF). The pipeline then
             buffers non-seekable input (stdin) before calling it.
     """
@@ -55,12 +58,17 @@ class Converter(Protocol):
 _BUILTINS: tuple[tuple[str, str], ...] = (
     ("text", "ctxify.converters.text:TextConverter"),
     ("csv", "ctxify.converters.csv:CsvConverter"),
+    ("json", "ctxify.converters.json:JsonConverter"),
     ("docx", "ctxify.converters.docx:DocxConverter"),
 )
 
 _converters: dict[str, Converter] = {}
+_missing: dict[str, str] = {}
 _builtins_loaded = False
 _plugins_loaded = False
+
+#: Install hint shown when a converter's optional dependency is absent.
+_INSTALL_HINT = "pip install 'ctxify[{extra}]'"
 
 
 def register(converter: Converter, *, replace: bool = False) -> None:
@@ -70,9 +78,14 @@ def register(converter: Converter, *, replace: bool = False) -> None:
     _converters[converter.name] = converter
 
 
+def _unregister_missing(name: str) -> None:
+    _missing.pop(name, None)
+
+
 def unregister(name: str) -> None:
     """Remove a converter (no error if absent)."""
     _converters.pop(name, None)
+    _unregister_missing(name)
 
 
 def _ensure_builtins() -> None:
@@ -84,8 +97,13 @@ def _ensure_builtins() -> None:
         if name in _converters:
             continue
         module_name, _, attr = target.partition(":")
-        cls = getattr(importlib.import_module(module_name), attr)
-        register(cls())
+        try:
+            cls = getattr(importlib.import_module(module_name), attr)
+            register(cls())
+        except ImportError as exc:  # optional dependency missing: skip, do not break
+            _missing[name] = str(exc)
+        except Exception as exc:  # a broken built-in must not take down the library
+            _missing[name] = f"{type(exc).__name__}: {exc}"
 
 
 def _ensure_plugins(notes: list[ConversionWarning]) -> None:
@@ -119,6 +137,12 @@ def get(name: str) -> Converter | None:
     return _converters.get(name)
 
 
+def missing() -> dict[str, str]:
+    """Converter name -> error, for built-ins that could not be loaded."""
+    _ensure_builtins()
+    return dict(_missing)
+
+
 def _best(head: bytes, filename: str | None, notes: list[ConversionWarning]) -> Converter | None:
     best: Converter | None = None
     best_score = 0.0
@@ -135,6 +159,16 @@ def _best(head: bytes, filename: str | None, notes: list[ConversionWarning]) -> 
     return best
 
 
+def _forced_error(name: str) -> ValueError:
+    available = ", ".join(sorted(_converters))
+    if name in _missing:
+        return ValueError(
+            f"type {name!r} is unavailable ({_missing[name]}); "
+            f"install it with {_INSTALL_HINT.format(extra=name)}"
+        )
+    return ValueError(f"unknown type {name!r}; available: {available}")
+
+
 def detect(
     head: bytes, filename: str | None, forced: str | None = None
 ) -> tuple[Converter | None, list[ConversionWarning]]:
@@ -149,7 +183,7 @@ def detect(
         ``(converter or None, notes)``. ``notes`` are warnings raised during detection.
 
     Raises:
-        ValueError: ``forced`` names an unknown converter.
+        ValueError: ``forced`` names an unknown (or dependency-less) converter.
     """
     _ensure_builtins()
     notes: list[ConversionWarning] = []
@@ -159,9 +193,7 @@ def detect(
             _ensure_plugins(notes)
             conv = _converters.get(forced)
         if conv is None:
-            raise ValueError(
-                f"unknown type {forced!r}; available: {', '.join(sorted(_converters))}"
-            )
+            raise _forced_error(forced)
         return conv, notes
     conv = _best(head, filename, notes)
     if conv is None and not _plugins_loaded:

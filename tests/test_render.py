@@ -142,6 +142,41 @@ def test_yaml_special_floats():
     assert loaded == [float("inf"), float("-inf")]
 
 
+def test_yaml_exponent_floats_round_trip():
+    yaml = pytest.importorskip("yaml")
+    for value in (1e-5, 1e20, -1.5e-9, 2.5e300):
+        loaded = yaml.safe_load(dump(value))
+        assert loaded == value and isinstance(loaded, float), (value, dump(value))
+
+
+def test_yaml_control_and_line_separator_characters_are_escaped():
+    yaml = pytest.importorskip("yaml")
+    for value in ("\x00", "\x7f", "\u2028", "\u2029", "\ufeff", "a\nb"):
+        assert yaml.safe_load(dump({"k": value})) == {"k": value}
+        assert yaml.safe_load(dump({value: 1})) == {value: 1}
+
+
+def test_front_matter_is_valid_for_machine_formats():
+    import ctxify
+
+    yaml = pytest.importorskip("yaml")
+    data = b"a,b\n1,2\n"
+    compact = ctxify.convert(
+        data, name="a.csv", format="json-compact", front_matter=True, token_backend="chars"
+    )
+    parsed = json.loads(compact.text)
+    assert set(parsed) == {"meta", "content"}
+    assert parsed["meta"]["source"] == "a.csv"
+
+    as_yaml = ctxify.convert(
+        data, name="a.csv", format="yaml", front_matter=True, token_backend="chars"
+    )
+    documents = list(yaml.safe_load_all(as_yaml.text))
+    assert len(documents) == 2
+    assert documents[0]["source"] == "a.csv"
+    assert documents[1][0]["type"] == "table"
+
+
 def test_front_matter_variants():
     meta = {"source": "a.txt", "tokens": 3}
     assert add_front_matter("body\n", meta, "md") == "---\nsource: a.txt\ntokens: 3\n---\n\nbody\n"
