@@ -140,12 +140,14 @@ def test_bad_budget_exits_two():
 
 
 def test_tokenizer_unavailable_exits_two(monkeypatch, tmp_path):
-    from ctxify import tokens
+    from ctxify import pipeline, tokens
 
     def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise tokens.TokenizerUnavailable("no")
 
-    monkeypatch.setattr(tokens, "get_counter", boom)
+    # The pipeline imports get_counter by value, so patch the reference it actually uses
+    # (otherwise the test only passes when tiktoken is absent from the environment).
+    monkeypatch.setattr(pipeline, "get_counter", boom)
     source = tmp_path / "a.txt"
     source.write_text("hi")
     assert main([str(source), "--token-backend", "tiktoken"]) == 2
