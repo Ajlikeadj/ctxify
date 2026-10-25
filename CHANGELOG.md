@@ -54,6 +54,9 @@ replaces the scaffold rather than extending it.
 
 ### Changed
 
+- Relicensed under GPL-3.0-only. The GPLv3 `LICENSE` added on the remote replaces the
+  earlier MIT text; `pyproject.toml`, the README and the release artifacts were updated
+  to match.
 - Strict mode raises `ConversionError` with every warning attached.
 - Front matter uses `tokens` and `token_backend` (previously documented as a single
   `token-estimate`).
