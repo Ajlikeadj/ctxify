@@ -160,6 +160,13 @@ def test_deeply_nested_json_is_skipped_not_crashed():
     assert r.warnings[0].severity == "skip"
 
 
+def test_brackets_inside_strings_do_not_count_toward_depth():
+    data = b'{"a": "' + b"[" * 5000 + b'"}'
+    r = convert(data, name="a.json")
+    assert "json-too-deep" not in codes(r)
+    assert r.text.startswith("a: ")
+
+
 def test_moderately_nested_json_is_preserved():
     depth = 100
     data = "[" * depth + "1" + "]" * depth

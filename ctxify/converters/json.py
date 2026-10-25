@@ -28,6 +28,7 @@ _SUMMARY_ROWS = 20
 _MAX_TABLE_KEYS = 20
 _MAX_NESTING = 200
 _UNSET = object()
+_TOO_DEEP = object()
 
 
 def _compact(value: object) -> str:
@@ -69,6 +70,45 @@ def _finite(value: Any) -> Any:
     if isinstance(value, list):
         return [_finite(v) for v in value]
     return value
+
+
+def _bracket_depth_exceeds(text: str, limit: int) -> bool:
+    """Cheap pre-parse guard: brackets outside strings nesting deeper than ``limit``.
+
+    Python versions differ in whether ``json.loads`` returns a 5,000-deep document or
+    raises ``RecursionError``; scanning first keeps the warning deterministic and avoids
+    the recursion path entirely.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif char in "]}":
+            depth -= 1
+    return False
+
+
+def _too_deep_warning() -> ConversionWarning:
+    return ConversionWarning(
+        "json-too-deep",
+        f"Nesting depth exceeds {_MAX_NESTING}; "
+        "the document was skipped rather than flattened.",
+        "skip",
+    )
 
 
 def _has_surrogates(value: Any) -> bool:
@@ -153,7 +193,15 @@ class JsonConverter:
 
         duplicates: list[str] = []
         constants: list[str] = []
+
+        if _bracket_depth_exceeds(text, _MAX_NESTING):
+            warnings.append(_too_deep_warning())
+            return Document([], Meta(source=filename, type=self.name), warnings)
+
         value = _parse_json(text, duplicates, constants)
+        if value is _TOO_DEEP:
+            warnings.append(_too_deep_warning())
+            return Document([], Meta(source=filename, type=self.name), warnings)
 
         if value is _UNSET:
             records, bad_lines = _parse_jsonl(text)
@@ -186,14 +234,7 @@ class JsonConverter:
             )
 
         if _depth(value) > _MAX_NESTING:
-            warnings.append(
-                ConversionWarning(
-                    "json-too-deep",
-                    f"Nesting depth exceeds {_MAX_NESTING}; "
-                    "the document was skipped rather than flattened.",
-                    "skip",
-                )
-            )
+            warnings.append(_too_deep_warning())
             return Document([], Meta(source=filename, type=self.name), warnings)
 
         if duplicates:
@@ -269,7 +310,9 @@ def _parse_json(text: str, duplicates: list[str], constants: list[str]) -> Any:
 
     try:
         return json.loads(text, object_pairs_hook=pairs_hook, parse_constant=constant_hook)
-    except (json.JSONDecodeError, ValueError, RecursionError):
+    except RecursionError:
+        return _TOO_DEEP
+    except (json.JSONDecodeError, ValueError):
         return _UNSET
 
 
